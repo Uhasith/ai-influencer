@@ -1,4 +1,4 @@
-import { useState, useEffect, createContext, useContext } from 'react'
+import { useState, useEffect, useRef, createContext, useContext } from 'react'
 
 // Generic small-value localStorage hook (inspiration boards, brand deals, etc.)
 function useLocalStorage(key, initial) {
@@ -97,7 +97,50 @@ function useInfluencerStore(initial) {
     return legacy.length > 0 ? legacy : initial
   })
 
+  const dbReadyRef = useRef(false)
+  const localSnapshotRef = useRef(null)
+
   useEffect(() => {
+    let cancelled = false
+    async function hydrateFromSqlite() {
+      try {
+        const localSnapshot = localSnapshotRef.current || influencers
+        const dbRes = await fetch('/api/local/influencers')
+        if (!dbRes.ok) throw new Error(`load failed (${dbRes.status})`)
+        const dbPayload = await dbRes.json()
+        const dbInfluencers = Array.isArray(dbPayload.influencers) ? dbPayload.influencers : []
+
+        const localIds = new Set(localSnapshot.map(i => i.id))
+        const dbIds = new Set(dbInfluencers.map(i => i.id))
+        const hasLocalOnlyProfiles = [...localIds].some(id => !dbIds.has(id))
+
+        if (!hasLocalOnlyProfiles) {
+          if (!cancelled && dbInfluencers.length) setInfluencers(dbInfluencers)
+          dbReadyRef.current = true
+          return
+        }
+
+        const migrationRes = await fetch('/api/local/influencers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ influencers: localSnapshot }),
+        })
+        if (!migrationRes.ok) throw new Error(`migration failed (${migrationRes.status})`)
+        const migrated = await migrationRes.json()
+        if (!cancelled && Array.isArray(migrated.influencers) && migrated.influencers.length) {
+          setInfluencers(migrated.influencers)
+        }
+        dbReadyRef.current = true
+      } catch (e) {
+        console.warn('[sqlite] using localStorage fallback:', e)
+      }
+    }
+    hydrateFromSqlite()
+    return () => { cancelled = true }
+  }, []) // eslint-disable-line
+
+  useEffect(() => {
+    localSnapshotRef.current = influencers
     const ids = influencers.map(i => i.id)
     writeIds(ids)
     for (const inf of influencers) writeInfluencer(inf)
@@ -108,6 +151,13 @@ function useInfluencerStore(initial) {
         const id = key.slice(INF_PREFIX.length)
         if (!idSet.has(id)) try { localStorage.removeItem(key) } catch {}
       }
+    }
+    if (dbReadyRef.current) {
+      fetch('/api/local/influencers', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ influencers }),
+      }).catch(e => console.warn('[sqlite] save failed:', e))
     }
   }, [influencers])
 

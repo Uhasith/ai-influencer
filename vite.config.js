@@ -1,5 +1,54 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { getInfluencers, mergeInfluencers, saveInfluencers } from './lib/localSqlite.js'
+
+async function readJsonBody(req) {
+  const chunks = []
+  req.on('data', c => chunks.push(c))
+  await new Promise(resolve => req.on('end', resolve))
+  const raw = Buffer.concat(chunks).toString()
+  return raw ? JSON.parse(raw) : null
+}
+
+function sendJson(res, status, data) {
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+  res.end(JSON.stringify(data))
+}
+
+// Local SQLite storage for dev. Browser localStorage is still used as a fallback/migration source.
+const localSqlitePlugin = {
+  name: 'local-sqlite-store',
+  configureServer(server) {
+    server.middlewares.use('/api/local/influencers', async (req, res) => {
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, POST, OPTIONS')
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+      if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return }
+
+      try {
+        if (req.method === 'GET') {
+          sendJson(res, 200, { influencers: await getInfluencers() })
+          return
+        }
+        if (req.method === 'POST') {
+          const body = await readJsonBody(req)
+          const influencers = await mergeInfluencers(body?.influencers || [])
+          sendJson(res, 200, { influencers })
+          return
+        }
+        if (req.method === 'PUT') {
+          const body = await readJsonBody(req)
+          await saveInfluencers(body?.influencers || [])
+          sendJson(res, 200, { ok: true })
+          return
+        }
+        sendJson(res, 405, { error: 'Method not allowed' })
+      } catch (e) {
+        sendJson(res, 500, { error: e.message })
+      }
+    })
+  },
+}
 
 // Local dev search proxy — mirrors api/search.js for Vercel production
 const searchPlugin = {
@@ -101,7 +150,7 @@ const claudePlugin = {
 }
 
 export default defineConfig({
-  plugins: [react(), searchPlugin, imgProxyPlugin, claudePlugin],
+  plugins: [react(), localSqlitePlugin, searchPlugin, imgProxyPlugin, claudePlugin],
   server: {
     proxy: {
       '/api/hf': {
