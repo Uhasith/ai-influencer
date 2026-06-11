@@ -1630,23 +1630,28 @@ const WARDROBE_STYLES_M = [
 const HAIR_PRESETS_F = ['Sleek bun', 'High ponytail', 'Beach waves', 'Blowout', 'Space buns', 'Braids', 'Half-up', 'Curtain bangs', 'Slicked back', 'Natural curls', 'Pixie cut', 'Bob']
 const HAIR_PRESETS_M = ['Low fade', 'Side part', 'Buzz cut', 'Slicked back', 'Textured crop', 'Tousled', 'Undercut', 'Man bun', 'Cornrows', 'Afro', 'Shaved sides', 'French crop']
 
-function buildWardrobePrompt(influencer, { outfit, hair, customText }) {
+function buildWardrobePrompt(influencer, { outfit, hair, customText, hasClothRef }) {
   const phys = influencer.physicalDesc ? `The subject: ${influencer.physicalDesc}. ` : ''
-  const identity = `IDENTITY LOCK — replicate exactly from reference: facial bone structure, face shape, jaw, nose bridge and tip, lip shape, eye shape and color, eyebrow arch and thickness, skin tone, skin texture and pores, all freckles, moles, marks, scars, natural asymmetries. Zero facial drift — this must be unmistakably the same person.`
+  const identity = `IDENTITY LOCK — @image1 is the person reference. Replicate exactly from @image1: facial bone structure, face shape, jaw, nose bridge and tip, lip shape, eye shape and color, eyebrow arch and thickness, skin tone, skin texture and pores, all freckles, moles, marks, scars, natural asymmetries. Zero facial drift — this must be unmistakably the same person.`
   const layout = `Output must be the exact same 4-panel character turnaround sheet as the reference image. Single row of four equally sized full-body panels with these labels in clean sans-serif capitals above each: "FRONT VIEW" | "SIDE VIEW" | "BACK VIEW" | "THREE-QUARTER VIEW". Keep identical body poses, stance, arm positions, proportions, and panel layout from the reference. Do NOT change poses, labels, panel structure, background (pure white seamless), or lighting.`
+  const clothRef = hasClothRef
+    ? `WARDROBE REFERENCE — @image2 is the clothing/outfit reference. The generated character must wear clothing that matches @image2 as closely as possible: same garment type, silhouette, color palette, fabric texture, visible pattern, neckline, sleeve length, hem length, closures, trims, and styling details. Adapt the garment naturally to the subject's body across all four turnaround panels. Do not copy the person, body, face, hair, hairstyle, pose, background, or lighting from @image2; use @image2 only for clothing. Preserve the subject's hair from @image1 unless a hairstyle is explicitly requested below.`
+    : ''
 
   const changeParts = [
     outfit && `outfit — ${outfit}`,
     hair && `hairstyle — ${hair}`,
     customText?.trim() || '',
   ].filter(Boolean)
-  const changes = `Change only: ${changeParts.join('; ') || 'casual stylish outfit, natural hairstyle'}.`
+  const changes = `Change only: ${changeParts.join('; ') || 'casual stylish outfit; preserve hairstyle from @image1'}.`
 
   return `Professional full-body character turnaround sheet. ${phys}Pure white seamless background throughout. Soft neutral studio lighting, perfectly flat and even across all four panels — no shadows, no color cast.
 
 ${layout}
 
 ${identity}
+
+${clothRef}
 
 ${changes}
 
@@ -1669,10 +1674,14 @@ function clearWardrobePending(influencerId) {
 }
 
 function WardrobeGenerator({ influencer, onAdd }) {
+  const clothFileRef = useRef()
   const [top, setTop] = useState('')
   const [bottom, setBottom] = useState('')
   const [hair, setHair] = useState('')
   const [customText, setCustomText] = useState('')
+  const [clothRefImage, setClothRefImage] = useState(null)
+  const [clothRefName, setClothRefName] = useState('')
+  const [selectedClothId, setSelectedClothId] = useState('')
   const [generating, setGenerating] = useState(false)
   const [progress, setProgress] = useState(0)
   const [error, setError] = useState(null)
@@ -1718,9 +1727,34 @@ function WardrobeGenerator({ influencer, onAdd }) {
       .finally(() => { clearWardrobePending(influencer.id); if (!cancelRef.current) { setGenerating(false); setProgress(0) } })
   }, [influencer.id])
 
+  const savedClothRefs = (influencer.wardrobeSlots || []).filter(s => s.image)
+  const selectedSavedCloth = savedClothRefs.find(s => s.id === selectedClothId) || null
+  const outfitImage = clothRefImage || selectedSavedCloth?.image || null
+
   const canGenerate = refImage && !generating && !result && (
-    customText.trim() || top.trim() || bottom.trim() || hair.trim()
+    customText.trim() || top.trim() || bottom.trim() || hair.trim() || outfitImage
   )
+
+  function handleClothFile(file) {
+    if (!file || !file.type.startsWith('image/')) return
+    const r = new FileReader()
+    r.onload = ev => {
+      compressImage(ev.target.result)
+        .then(img => {
+          setClothRefImage(img)
+          setClothRefName(file.name.replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ').trim() || 'Uploaded clothing reference')
+          setSelectedClothId('')
+        })
+        .catch(console.error)
+    }
+    r.readAsDataURL(file)
+  }
+
+  function clearClothRef() {
+    setClothRefImage(null)
+    setClothRefName('')
+    setSelectedClothId('')
+  }
 
   function cancelGeneration() {
     cancelRef.current = true
@@ -1738,9 +1772,10 @@ function WardrobeGenerator({ influencer, onAdd }) {
       const prompt = buildWardrobePrompt(influencer, {
         outfit: outfitText, hair,
         customText: customText || null,
+        hasClothRef: !!outfitImage,
       })
       const url = await generateSingleImage({
-        prompt, aspectRatio: '16:9', referenceImage: refImage, onProgress: setProgress,
+        prompt, aspectRatio: '16:9', referenceImage: refImage, outfitImage, onProgress: setProgress,
         onJobIds: jobIds => saveWardrobePending(influencer.id, { jobIds, label }),
         isCancelled: () => cancelRef.current,
       })
@@ -1762,7 +1797,7 @@ function WardrobeGenerator({ influencer, onAdd }) {
     if (!result) return
     onAdd({ id: generateId(), name: saveName.trim() || result.name, image: result.url })
     try { localStorage.removeItem(`wd_gen_result_${influencer.id}`) } catch {}
-    setResult(null); setSaveName(''); setTop(''); setBottom(''); setHair(''); setCustomText('')
+    setResult(null); setSaveName(''); setTop(''); setBottom(''); setHair(''); setCustomText(''); clearClothRef()
   }
 
   function discardResult() {
@@ -1853,6 +1888,50 @@ function WardrobeGenerator({ influencer, onAdd }) {
       {!result && !generating && (<>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div>
+            <div style={lS}>Clothing reference</div>
+            <input ref={clothFileRef} type="file" accept="image/*" style={{display:'none'}}
+              onChange={e=>{handleClothFile(e.target.files[0]);e.target.value=''}}/>
+            <div style={{ display:'grid', gridTemplateColumns:'96px 1fr', gap:12, alignItems:'stretch' }}>
+              <div
+                onClick={()=>clothFileRef.current.click()}
+                onDragOver={e=>{e.preventDefault();e.currentTarget.style.borderColor='#8B5CF6';e.currentTarget.style.background='rgba(139,92,246,0.07)'}}
+                onDragLeave={e=>{e.currentTarget.style.borderColor='var(--border)';e.currentTarget.style.background='var(--bg)'}}
+                onDrop={e=>{e.preventDefault();e.currentTarget.style.borderColor='var(--border)';e.currentTarget.style.background='var(--bg)';handleClothFile(e.dataTransfer.files[0])}}
+                style={{
+                  height:96, borderRadius:10, border:'1.5px dashed var(--border)',
+                  background:'var(--bg)', overflow:'hidden', cursor:'pointer',
+                  display:'flex', alignItems:'center', justifyContent:'center',
+                }}
+              >
+                {outfitImage
+                  ? <img src={outfitImage} alt="" style={{width:'100%',height:'100%',objectFit:'cover',display:'block'}}/>
+                  : <div style={{textAlign:'center',fontSize:11,color:'var(--text-tertiary)',lineHeight:1.35}}>Upload<br/>cloth image</div>
+                }
+              </div>
+              <div style={{ minWidth:0, display:'flex', flexDirection:'column', gap:8 }}>
+                {savedClothRefs.length > 0 && (
+                  <select value={selectedClothId} onChange={e=>{setSelectedClothId(e.target.value);setClothRefImage(null);setClothRefName('')}}
+                    style={iS}>
+                    <option value="">Use uploaded clothing image</option>
+                    {savedClothRefs.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                  </select>
+                )}
+                <div style={{fontSize:12,color:'var(--text-tertiary)',lineHeight:1.45}}>
+                  {outfitImage
+                    ? `Using: ${clothRefName || selectedSavedCloth?.name || 'clothing reference'}`
+                    : 'Optional. Add a dress, outfit, product shot, or styling reference. The generated look will match the clothing while keeping the influencer identity from the character sheet.'}
+                </div>
+                {outfitImage && (
+                  <button type="button" onClick={clearClothRef} style={{
+                    alignSelf:'flex-start', padding:'6px 10px', borderRadius:8,
+                    background:'var(--bg-tertiary)', color:'var(--text-secondary)',
+                    fontSize:12, fontWeight:600, border:'none', cursor:'pointer',
+                  }}>Clear reference</button>
+                )}
+              </div>
+            </div>
+          </div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <div>
               <div style={lS}>Top</div>
@@ -3412,41 +3491,53 @@ function HistoryCard({ entry, onDelete, onDownload, isSelected, onSelect, showSe
 const PHOTO_STUDIO_HISTORY_KEY = 'photo_studio_history'
 
 function HistoryTab({ influencer, onUpdate, onReuseSettings }) {
+  const dbPhotoEntries = useMemo(() => (
+    (influencer.generationHistory || [])
+      .filter(e => e.type === 'image' && (e.label === 'Photo Studio' || e.source === 'photo_studio'))
+      .map(e => ({
+        histId: e.id,
+        url: e.url,
+        influencerId: influencer.id,
+        influencerName: influencer.name,
+        createdAt: e.date || e.createdAt || Date.now(),
+        label: e.label || 'Image',
+        settings: e.settings || null,
+        source: 'db',
+      }))
+  ), [influencer.generationHistory, influencer.id, influencer.name])
+
   const [segment, setSegment] = useState('photos')
   const [selected, setSelected] = useState(new Set())
 
-  // Photo Studio — from localStorage, filtered by this influencer
-  const [photoEntries, setPhotoEntries] = useState(() => {
+  function readPhotoEntries() {
     try {
-      return JSON.parse(localStorage.getItem(PHOTO_STUDIO_HISTORY_KEY) || '[]')
+      const dbUrls = new Set(dbPhotoEntries.map(e => e.url))
+      const legacy = JSON.parse(localStorage.getItem(PHOTO_STUDIO_HISTORY_KEY) || '[]')
         .filter(h => h.influencerId === influencer.id)
-    } catch { return [] }
+        .filter(h => !dbUrls.has(h.url))
+      return [...dbPhotoEntries, ...legacy]
+    } catch { return dbPhotoEntries }
+  }
+
+  // Photo Studio — DB-backed, plus legacy localStorage entries
+  const [photoEntries, setPhotoEntries] = useState(() => {
+    return readPhotoEntries()
   })
 
   // Re-read when influencer changes
   useEffect(() => {
-    try {
-      setPhotoEntries(
-        JSON.parse(localStorage.getItem(PHOTO_STUDIO_HISTORY_KEY) || '[]')
-          .filter(h => h.influencerId === influencer.id)
-      )
-    } catch {}
+    setPhotoEntries(readPhotoEntries())
     setSelected(new Set())
-  }, [influencer.id])
+  }, [influencer.id, dbPhotoEntries])
 
   // Re-read when PhotoStudio adds a new entry in the same browser tab
   useEffect(() => {
     function onUpdate() {
-      try {
-        setPhotoEntries(
-          JSON.parse(localStorage.getItem(PHOTO_STUDIO_HISTORY_KEY) || '[]')
-            .filter(h => h.influencerId === influencer.id)
-        )
-      } catch {}
+      setPhotoEntries(readPhotoEntries())
     }
     window.addEventListener('photo_studio_history_updated', onUpdate)
     return () => window.removeEventListener('photo_studio_history_updated', onUpdate)
-  }, [influencer.id])
+  }, [influencer.id, dbPhotoEntries])
 
   // Content Studio — only videos from generationHistory
   const videoEntries = (influencer.generationHistory || []).filter(e => e.type === 'video')
@@ -3460,11 +3551,12 @@ function HistoryTab({ influencer, onUpdate, onReuseSettings }) {
 
   function deleteEntry(entry) {
     if (segment === 'photos') {
+      onUpdate({ generationHistory: (influencer.generationHistory || []).filter(e => e.url !== entry.url) })
       try {
         const all = JSON.parse(localStorage.getItem(PHOTO_STUDIO_HISTORY_KEY) || '[]')
         const next = all.filter(h => h.url !== entry.url || h.createdAt !== entry.createdAt)
         localStorage.setItem(PHOTO_STUDIO_HISTORY_KEY, JSON.stringify(next))
-        setPhotoEntries(next.filter(h => h.influencerId === influencer.id))
+        setPhotoEntries(readPhotoEntries().filter(h => h.url !== entry.url))
       } catch {}
     } else {
       onUpdate({ generationHistory: (influencer.generationHistory || []).filter(e => e.id !== entry.id) })
@@ -3474,12 +3566,14 @@ function HistoryTab({ influencer, onUpdate, onReuseSettings }) {
 
   function deleteSelected() {
     if (segment === 'photos') {
+      const keys = selected
+      const selectedUrls = new Set(photoEntries.filter(h => keys.has(h.url) || keys.has(h.histId)).map(h => h.url))
+      onUpdate({ generationHistory: (influencer.generationHistory || []).filter(e => !selectedUrls.has(e.url)) })
       try {
-        const keys = selected
         const all = JSON.parse(localStorage.getItem(PHOTO_STUDIO_HISTORY_KEY) || '[]')
-        const next = all.filter(h => !(h.influencerId === influencer.id && keys.has(h.url)))
+        const next = all.filter(h => !(h.influencerId === influencer.id && (keys.has(h.url) || keys.has(h.histId))))
         localStorage.setItem(PHOTO_STUDIO_HISTORY_KEY, JSON.stringify(next))
-        setPhotoEntries(next.filter(h => h.influencerId === influencer.id))
+        setPhotoEntries(readPhotoEntries().filter(h => !selectedUrls.has(h.url)))
       } catch {}
     } else {
       const keys = selected
@@ -6224,6 +6318,19 @@ export default function Influencers() {
               setStudioTab('content')
               localStorage.setItem('inf_studio_tab', 'content')
               setTimeout(() => mainPaneRef.current?.scrollTo({ top: 0, behavior: 'smooth' }), 50)
+            }} onGeneratedPhoto={item => {
+              const existing = influencer.generationHistory || []
+              if (existing.some(e => e.url === item.url)) return
+              upd(influencer.id, {
+                generationHistory: [{
+                  id: item.histId || generateId(),
+                  type: 'image',
+                  label: 'Photo Studio',
+                  url: item.url,
+                  date: item.createdAt || Date.now(),
+                  settings: item.settings || null,
+                }, ...existing].slice(0, 300),
+              })
             }} />
           </div>
 

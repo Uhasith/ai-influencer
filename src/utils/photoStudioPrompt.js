@@ -439,7 +439,7 @@ export function buildPhotoStudioPrompt({ influencer, location, timeOfDay, pose, 
   const outfitMap = gender === 'Male' ? OUTFIT_PRESET_MAP_MALE : OUTFIT_PRESET_MAP_FEMALE
   const hasHairstyleOverride = !!hairstyleText?.trim()
   const wardrobe = wardrobeTag
-    ? `the complete outfit from ${wardrobeTag} — reproduce every item exactly as shown: all clothing, headwear, and accessories must match the reference. If headwear is present in the reference, it must be worn on the head${hasHairstyleOverride ? '' : '. Match the hairstyle from this reference exactly'}`
+    ? `the complete outfit from ${wardrobeTag} — reproduce every clothing item exactly as shown: garment type, silhouette, fabric, colors, patterns, styling, headwear, and accessories must match the reference. Use ${wardrobeTag} only for wardrobe; do not copy the face, body, skin, hair, hairstyle, pose, background, or lighting from it. Hair identity stays locked to ${faceTag || 'the influencer identity reference'} unless an explicit hairstyle override is provided.`
     : wardrobeText?.trim()
       || (outfitPreset && outfitPreset !== 'current' && outfitMap[outfitPreset])
       || 'their current outfit'

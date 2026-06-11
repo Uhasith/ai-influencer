@@ -480,10 +480,39 @@ const TEMPLATE_IDS = new Set(['kayla-template', 'camila-template', 'marcus-templ
 
 export function StoreProvider({ children }) {
   const influencerStore = useInfluencerStore([KAYLA_SEED, CAMILA_SEED, MARCUS_SEED])
+  const [influencers, setInfluencers] = influencerStore
   const inspirationState = useLocalStorage('inspiration_boards', [])
   const brandDealsState  = useLocalStorage('brand_deals', [])
   const [, setInspirationBoards] = inspirationState
   const [, setDealsData]         = brandDealsState
+
+  // DB-first migration: pull old browser-only Photo Studio history into influencer records.
+  useEffect(() => {
+    try {
+      const legacyPhotos = JSON.parse(localStorage.getItem('photo_studio_history') || '[]')
+      if (!legacyPhotos.length) return
+      let changed = false
+      const nextInfluencers = influencers.map(inf => {
+        const existing = inf.generationHistory || []
+        const existingUrls = new Set(existing.map(e => e.url))
+        const toAdd = legacyPhotos
+          .filter(p => p.influencerId === inf.id && p.url && !existingUrls.has(p.url))
+          .map(p => ({
+            id: p.histId || generateId(),
+            type: 'image',
+            label: 'Photo Studio',
+            url: p.url,
+            date: p.createdAt || Date.now(),
+            settings: p.settings || null,
+            source: 'photo_studio',
+          }))
+        if (!toAdd.length) return inf
+        changed = true
+        return { ...inf, generationHistory: [...toAdd, ...existing].slice(0, 300) }
+      })
+      if (changed) setInfluencers(nextInfluencers)
+    } catch {}
+  }, [influencers, setInfluencers])
 
   // Seed from /seeds.json when seed IDs are missing from localStorage
   useEffect(() => {

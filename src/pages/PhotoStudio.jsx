@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { generateNImages, generatePosePreviews, generateSingleImage, savePendingPhoto, clearPendingPhoto, getPendingPhoto, pollAllJobs, hasPhotoGenSession } from '../utils/higgsfieldGenerate'
 import { isHFConnected } from '../utils/higgsfieldAuth'
@@ -381,7 +381,7 @@ function loadSettings(id) {
 
 const PS_DEFAULTS = { location: 'coffee-shop', timeOfDay: 'afternoon', pose: 'front', outfitPreset: 'current', stance: 'standing', aspectRatio: '9:16', resolution: '4k', outputCount: 1, expression: 'natural', gaze: 'at-camera', propText: '', wardrobeText: '', hairstyleText: '' }
 
-export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsStartFrame, restoreKey = 0 }) {
+export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsStartFrame, onGeneratedPhoto, restoreKey = 0 }) {
   const [, setInfluencers] = useInfluencers()
   const [brandDeals] = useBrandDeals()
   const _s = loadSettings(influencer?.id)
@@ -545,7 +545,7 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
     if (!hasPhotoGenSession()) return          // fresh load — nothing in-flight
     const pending = getPendingPhoto(influencer?.id)
     if (!pending) return
-    if (Date.now() - pending.startedAt > 5 * 60 * 1000) { clearPendingPhoto(influencer?.id); return }
+    if (Date.now() - pending.startedAt > 30 * 60 * 1000) { clearPendingPhoto(influencer?.id); return }
     cancelRef.current = false
     generatingForIdRef.current = influencer?.id  // so isActivelyGenerating = true and button shows correctly
     setGenerating(true)
@@ -618,6 +618,7 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
     const item = { histId: `${Date.now()}-${Math.random().toString(36).slice(2,7)}`, url, batchId, influencerId: influencer?.id, influencerName: influencer?.name, location, timeOfDay, pose, vibe, aspectRatio, createdAt: Date.now(),
       settings: { location, timeOfDay, pose, stance, expression, gaze, outfitPreset, wardrobeText, hairstyleText, propText, aspectRatio, resolution, outputCount }
     }
+    onGeneratedPhoto?.(item)
     setHistory(prev => {
       const next = [item, ...prev].slice(0, MAX_HISTORY)
       try {
@@ -722,6 +723,7 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
       const prompt = Array.from({ length: outputCount }, (_, i) => buildPhotoStudioPrompt({ ...promptArgs, variationIdx: i }))
 
       const batchId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+      let failureMessage = ''
       try {
         await generateNImages({
           prompt, count: outputCount, aspectRatio, resolution,
@@ -743,11 +745,15 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
           pendingKey: influencer?.id,
         })
       } catch (e) {
-        if (!cancelRef.current) console.warn('[Photo Studio] generation failed:', e.message)
+        if (!cancelRef.current) {
+          failureMessage = e.message || 'Generation failed'
+          console.warn('[Photo Studio] generation failed:', failureMessage)
+        }
       }
 
-      if (!cancelRef.current) clearPendingPhoto(influencer?.id)
-      if (!anySuccess && !cancelRef.current) setError('Generation failed — try again')
+      const mayFinishLater = failureMessage.toLowerCase().includes('timed out')
+      if (!cancelRef.current && (anySuccess || !mayFinishLater)) clearPendingPhoto(influencer?.id)
+      if (!anySuccess && !cancelRef.current) setError(failureMessage || 'Generation failed — try again')
     } finally {
       generatingForIdRef.current = null
       setGenerating(false)
@@ -790,7 +796,34 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
   const locVis       = LOC_VISUAL[location]  || LOC_VISUAL['coffee-shop']
   const timeVis      = TIME_VISUAL[timeOfDay] || TIME_VISUAL['afternoon']
   const wardrobeSlots = (influencer?.wardrobeSlots || []).filter(s => s.name)
-  const infHistory   = history.filter(h => h.influencerId === influencer?.id)
+  const dbPhotoHistory = useMemo(() => (
+    (influencer?.generationHistory || [])
+      .filter(e => e.type === 'image' && (e.label === 'Photo Studio' || e.source === 'photo_studio'))
+      .map(e => ({
+        histId: e.id,
+        url: e.url,
+        batchId: e.batchId,
+        influencerId: influencer?.id,
+        influencerName: influencer?.name,
+        location: e.settings?.location || '',
+        timeOfDay: e.settings?.timeOfDay || '',
+        pose: e.settings?.pose || '',
+        vibe: e.settings?.vibe || 'candid',
+        aspectRatio: e.settings?.aspectRatio || aspectRatio,
+        createdAt: e.date || e.createdAt || Date.now(),
+        settings: e.settings || null,
+        source: 'db',
+      }))
+  ), [influencer?.generationHistory, influencer?.id, influencer?.name, aspectRatio])
+  const infHistory = useMemo(() => {
+    const dbUrls = new Set(dbPhotoHistory.map(h => h.url))
+    return [
+      ...dbPhotoHistory,
+      ...history
+        .filter(h => h.influencerId === influencer?.id)
+        .filter(h => !dbUrls.has(h.url)),
+    ]
+  }, [dbPhotoHistory, history, influencer?.id])
   const refImage     = overrideRef || influencer?.mainImage || null
   const locPreviewUrl = LOC_PREVIEWS[`${location}-${timeOfDay}`] || null
   // Pose preview: stance-keyed first; unkeyed fallback only for standing (old previews are standing images);
@@ -1683,6 +1716,13 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
                         setHistory(next)
                         try { localStorage.setItem(HISTORY_KEY, JSON.stringify(next)) } catch {}
                         const deletedUrls = new Set(infHistory.filter(h => ids.has(h.histId || h.url)).map(h => h.url))
+                        setInfluencers(prev => prev.map(inf => {
+                          if (inf.id !== influencer?.id) return inf
+                          return {
+                            ...inf,
+                            generationHistory: (inf.generationHistory || []).filter(e => !deletedUrls.has(e.url)),
+                          }
+                        }))
                         setCurrentImgs(prev => prev.filter(u => !deletedUrls.has(u)))
                         setSelectedHistIds(new Set())
                         setConfirmClear(null)

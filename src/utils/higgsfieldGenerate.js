@@ -931,8 +931,10 @@ export async function generateNImages({ prompt, count = 1, aspectRatio = '9:16',
   // Sequential per job per round — parallel MCP calls conflict on the shared session.
   const pending = new Set(jobIds)
   let deliveredCount = directUrls.length
+  const terminalStatuses = []
+  const maxRounds = refEntries.length ? 90 : 60
 
-  for (let round = 0; round < 60 && pending.size > 0 && deliveredCount < count; round++) {
+  for (let round = 0; round < maxRounds && pending.size > 0 && deliveredCount < count; round++) {
     if (isCancelled?.()) throw new Error('CANCELLED')
     if (round > 0) await new Promise(r => setTimeout(r, 3000))
     if (isCancelled?.()) throw new Error('CANCELLED')
@@ -950,6 +952,7 @@ export async function generateNImages({ prompt, count = 1, aspectRatio = '9:16',
           }
         } else if (IMAGE_TERMINAL.has(status)) {
           pending.delete(jobId)
+          terminalStatuses.push(status || 'terminal')
           console.warn('[HF] job', jobId.slice(0, 8), 'terminal without URL, status:', status)
         }
       } catch (e) {
@@ -960,6 +963,10 @@ export async function generateNImages({ prompt, count = 1, aspectRatio = '9:16',
   }
 
   if (deliveredCount > 0) { onProgress?.(100); return }
+  if (terminalStatuses.length) {
+    const uniq = [...new Set(terminalStatuses)].join(', ')
+    throw new Error(`Higgsfield image job ended without an image: ${uniq}`)
+  }
   throw new Error('Generation timed out — check Higgsfield dashboard')
 }
 
