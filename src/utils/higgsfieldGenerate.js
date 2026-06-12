@@ -1,4 +1,5 @@
 import { getHFToken, refreshHFToken, disconnectHF } from './higgsfieldAuth'
+import { storeImageAsset, updateImageAssetProviderRef } from './assetStore.js'
 
 const MCP_URL = '/api/hf/mcp'
 const PENDING_KEY = 'hf_pending_gens'
@@ -402,10 +403,19 @@ async function pollVideoJobs(jobIds, total, onProgress, onPartialResults, isCanc
 // Shared upload pipeline for any media kind. Caches by fingerprint so the same
 // data URL is never uploaded twice. Returns the CDN URL (or media_id as fallback).
 async function uploadMedia(dataUrl, { type, defaultContentType, getExt, prefix }) {
+  const asset = type === 'image' ? await storeImageAsset(dataUrl, prefix === 'ref' ? 'reference' : type) : null
+  const cachedProviderRef = asset?.providerRefs?.higgsfield
+  if (cachedProviderRef) {
+    hflog(`[HF] asset store hit (${type}) — reusing Higgsfield media ref`)
+    return cachedProviderRef
+  }
+
   const fp = mediaFingerprint(dataUrl)
   if (_mediaCache.has(fp)) {
     hflog(`[HF] media cache hit (${type}) — skipping upload`)
-    return _mediaCache.get(fp)
+    const cached = _mediaCache.get(fp)
+    if (asset?.hash) updateImageAssetProviderRef(asset.hash, 'higgsfield', cached)
+    return cached
   }
 
   const res = await fetch(dataUrl)
@@ -442,15 +452,26 @@ async function uploadMedia(dataUrl, { type, defaultContentType, getExt, prefix }
   hflog('[HF] media_confirm raw:', JSON.stringify(confirmed)?.slice(0, 500))
 
   const cdnUrl = confirmed?.url || confirmed?.media_url || confirmed?.rawUrl || confirmed?.cdn_url
-  if (cdnUrl) { _mediaCache.set(fp, cdnUrl); _mediaCacheSave(); return cdnUrl }
+  if (cdnUrl) {
+    _mediaCache.set(fp, cdnUrl)
+    if (asset?.hash) updateImageAssetProviderRef(asset.hash, 'higgsfield', cdnUrl)
+    _mediaCacheSave()
+    return cdnUrl
+  }
 
   if (typeof confirmed === 'string') {
     const urlMatch = confirmed.match(/https:\/\/[^\s"'\\]+/)
-    if (urlMatch) { _mediaCache.set(fp, urlMatch[0]); _mediaCacheSave(); return urlMatch[0] }
+    if (urlMatch) {
+      _mediaCache.set(fp, urlMatch[0])
+      if (asset?.hash) updateImageAssetProviderRef(asset.hash, 'higgsfield', urlMatch[0])
+      _mediaCacheSave()
+      return urlMatch[0]
+    }
   }
 
   const fallback = confirmed?.media_id || confirmed?.id || mediaId
   _mediaCache.set(fp, fallback); _mediaCacheSave()
+  if (asset?.hash) updateImageAssetProviderRef(asset.hash, 'higgsfield', fallback)
   return fallback
 }
 
@@ -876,7 +897,7 @@ export async function generateSingleImage({ prompt, aspectRatio = '16:9', resolu
 // ── Photo Studio batch generation ────────────────────────────────────────────
 // Uploads refs once, launches all N jobs in parallel, polls together, and streams
 // results via onResult(url) as each image completes.
-export async function generateNImages({ prompt, count = 1, aspectRatio = '9:16', resolution = '4k', referenceImage = null, outfitImage = null, closeUpImage1 = null, closeUpImage2 = null, propImages = [], onProgress, onResult, isCancelled, pendingKey = null }) {
+export async function generateNImages({ prompt, count = 1, aspectRatio = '9:16', resolution = '4k', referenceImage = null, outfitImage = null, closeUpImage1 = null, closeUpImage2 = null, referenceStyleImage = null, propImages = [], onProgress, onResult, isCancelled, pendingKey = null }) {
   await initSession()
   onProgress?.(5)
 
@@ -887,6 +908,7 @@ export async function generateNImages({ prompt, count = 1, aspectRatio = '9:16',
     { img: outfitImage,    label: 'outfit'   },
     { img: closeUpImage1,  label: 'closeup1' },
     { img: closeUpImage2,  label: 'closeup2' },
+    { img: referenceStyleImage, label: 'reference-style' },
     ...propImages.map((img, i) => ({ img, label: `prop${i + 1}` })),
   ].filter(e => e.img)
 

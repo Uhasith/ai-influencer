@@ -1,4 +1,6 @@
 // GPT Image 2 Photo Studio prompt engine
+import { pickSelectedReferenceAttributes } from './referenceExtractor.js'
+import { withReferenceIdentityProtection } from './generationSafety.js'
 // Based on the photo-studio-influencer-guide.md realism spec
 
 export const LOCATIONS = [
@@ -413,7 +415,8 @@ const CANDID_ACTIONS = [
 // @image1 = identity (influencer main photo), @image2 = outfit (character sheet / wardrobe card).
 // Prompt is short and directive: placement + action only. Do not re-describe the refs.
 
-export function buildPhotoStudioPrompt({ influencer, location, timeOfDay, pose, vibe, wardrobeText, hairstyleText, outfitPreset, stance, aspectRatio, expression, gaze = 'at-camera', propText, propRefs = [], faceTag = null, wardrobeTag = null, closeUp1Tag = null, closeUp2Tag = null, variationIdx = null }) {
+export function buildPhotoStudioPrompt({ influencer, location, timeOfDay, pose, vibe, wardrobeText, hairstyleText, outfitPreset, stance, aspectRatio, expression, gaze = 'at-camera', propText, propRefs = [], faceTag = null, wardrobeTag = null, closeUp1Tag = null, closeUp2Tag = null, referenceImageTag = null, variationIdx = null, referenceAttributes = null, referenceAttributeSelection = null }) {
+  const refAttrs = pickSelectedReferenceAttributes(referenceAttributes, referenceAttributeSelection || {})
   const loc       = location    || 'coffee-shop'
   const tod       = timeOfDay   || 'afternoon'
   const poseId    = pose        || 'front'
@@ -438,7 +441,11 @@ export function buildPhotoStudioPrompt({ influencer, location, timeOfDay, pose, 
   const gender = influencer?.gender || 'Female'
   const outfitMap = gender === 'Male' ? OUTFIT_PRESET_MAP_MALE : OUTFIT_PRESET_MAP_FEMALE
   const hasHairstyleOverride = !!hairstyleText?.trim()
-  const wardrobe = wardrobeTag
+  const inheritReferenceOutfit = !!(referenceAttributeSelection?.outfit && refAttrs.outfitDescription)
+  const inheritReferenceHairstyle = !!(referenceAttributeSelection?.hairstyle && refAttrs.hairstyleDescription && !hasHairstyleOverride)
+  const wardrobe = inheritReferenceOutfit
+    ? `${refAttrs.outfitDescription} — inherit only the outfit styling and visible garment details from the uploaded reference image metadata. Do not copy the reference person, body identity, face, tattoos, private identifying traits, or unsafe logos.`
+    : wardrobeTag
     ? `the complete outfit from ${wardrobeTag} — reproduce every clothing item exactly as shown: garment type, silhouette, fabric, colors, patterns, styling, headwear, and accessories must match the reference. Use ${wardrobeTag} only for wardrobe; do not copy the face, body, skin, hair, hairstyle, pose, background, or lighting from it. Hair identity stays locked to ${faceTag || 'the influencer identity reference'} unless an explicit hairstyle override is provided.`
     : wardrobeText?.trim()
       || (outfitPreset && outfitPreset !== 'current' && outfitMap[outfitPreset])
@@ -453,7 +460,9 @@ export function buildPhotoStudioPrompt({ influencer, location, timeOfDay, pose, 
 
   // ── Pose — kept detailed, this is the primary direction ───────────
   let basePose
-  if (poseId === 'candid') {
+  if (refAttrs.pose) {
+    basePose = `Match the selected non-identity pose geometry from the uploaded reference: ${refAttrs.pose}. This includes body position, torso angle, shoulder direction, head turn, face angle, and gaze direction. If the reference subject is looking left, right, up, down, away from camera, in profile, or in a three-quarter face angle, reproduce that same direction with the AI character. Do not keep the face angle from ${faceTag || 'the identity reference'} if it conflicts with the selected reference pose; use ${faceTag || 'the identity reference'} only for who the character is, not which way the head or face is turned.`
+  } else if (poseId === 'candid') {
     // Pick one specific action — never give the model a list of options.
     // Use variationIdx so each slot in a batch gets a different action.
     const idx = variationIdx !== null ? variationIdx : Math.floor(Math.random() * CANDID_ACTIONS.length)
@@ -471,7 +480,9 @@ export function buildPhotoStudioPrompt({ influencer, location, timeOfDay, pose, 
   const poseDesc = stancePrefix + basePose
 
   // ── Expression (omit if natural; use custom text if not a known preset) ─
-  const expressionDesc = EXPRESSION_MAP[expression] !== undefined
+  const expressionDesc = refAttrs.expression
+    ? `Expression/mood: ${refAttrs.expression}.`
+    : EXPRESSION_MAP[expression] !== undefined
     ? (EXPRESSION_MAP[expression] || '')
     : (expression?.trim() ? `Expression: ${expression.trim()}.` : '')
 
@@ -524,26 +535,45 @@ export function buildPhotoStudioPrompt({ influencer, location, timeOfDay, pose, 
     : BACKGROUND_PEOPLE[variationIdx !== null ? variationIdx % BACKGROUND_PEOPLE.length : 0]
 
   // ── Location label + time atmosphere + lighting ───────────────────
-  const locationLabel = LOCATION_LABEL[loc] || (loc?.trim() ? `The location is ${loc.trim()}.` : '')
-  const timeAtmo      = TIME_ATMO[tod]      || ''
-  const light         = SHORT_LIGHTING[loc]?.[tod] || ''
+  const locationLabel = refAttrs.location
+    ? `The location/environment follows the uploaded reference metadata: ${refAttrs.location}.`
+    : LOCATION_LABEL[loc] || (loc?.trim() ? `The location is ${loc.trim()}.` : '')
+  const timeAtmo = refAttrs.timeOfDay
+    ? `Time of day: ${refAttrs.timeOfDay}.`
+    : TIME_ATMO[tod] || ''
+  const light = refAttrs.lighting
+    ? `Lighting: ${refAttrs.lighting}.`
+    : SHORT_LIGHTING[loc]?.[tod] || ''
 
   // ── Camera + framing ──────────────────────────────────────────────
-  const cameraFeel = vibe === 'editorial' ? 'Eye-level, 50mm lens feel.'
+  const cameraFeel = refAttrs.cameraAngle
+    ? `Camera angle: ${refAttrs.cameraAngle}.`
+    : vibe === 'editorial' ? 'Eye-level, 50mm lens feel.'
     : vibe === 'luxury' ? 'Eye-level, 28mm, clinical sharpness.'
     : 'Eye-level, 24mm, handheld.'
 
-  const framing = isSitting
+  const framing = refAttrs.framing
+    ? `Framing: ${refAttrs.framing}.`
+    : isSitting
     ? (ratio === '16:9' ? '16:9, waist-up.' : '9:16, 3/4 framing head to mid-thigh.')
     : (ratio === '16:9' ? '16:9, waist-up framing.' : '9:16, chest-up framing.')
 
   // ── Hairstyle override — beats any reference image ───────────────
   const hairstyleDesc = hasHairstyleOverride
     ? `Hairstyle: ${hairstyleText.trim()} — apply this hairstyle exactly, overriding the hairstyle shown in any reference image.`
+    : inheritReferenceHairstyle
+    ? `Hairstyle: ${refAttrs.hairstyleDescription} — inherit only the hairstyle from the uploaded reference metadata, not the reference person's face or identity.`
     : ''
 
+  const referenceDetails = [
+    referenceImageTag ? `Use ${referenceImageTag} only as a visual guide for the selected non-identity reference attributes, including head direction, face angle, gaze direction, body orientation, composition, and lighting when selected. Do not copy the person, face, body identity, biometric traits, tattoos, or logos from ${referenceImageTag}. Render the AI character identity from ${faceTag || 'the character reference'} from the needed angle.` : '',
+    refAttrs.composition ? `Composition: ${refAttrs.composition}.` : '',
+    refAttrs.photoStyle ? `Photography style/color tone: ${refAttrs.photoStyle}.` : '',
+    refAttrs.props?.length ? `Props from reference metadata: ${refAttrs.props.join(', ')}.` : '',
+  ].filter(Boolean).join(' ')
+
   // ── Assemble into tight paragraph ────────────────────────────────
-  return [
+  const prompt = [
     `${shotType} of ${subject}, wearing ${wardrobe}.`,
     hairstyleDesc,
     closeUpLine,
@@ -551,10 +581,12 @@ export function buildPhotoStudioPrompt({ influencer, location, timeOfDay, pose, 
     expressionDesc,
     gazeDesc,
     propDesc,
+    referenceDetails,
     [locationLabel, scene, timeAtmo, light].filter(Boolean).join(' '),
     `${cameraFeel} ${framing}`,
     `Deep focus, no bokeh, photorealistic. ${peopleLine}`,
   ].filter(Boolean).join(' ')
+  return withReferenceIdentityProtection(prompt, !!referenceAttributes)
 }
 
 export function randomParams() {

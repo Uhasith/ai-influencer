@@ -5,6 +5,9 @@ import { isHFConnected } from '../utils/higgsfieldAuth'
 import { buildCharSheetPrompt, buildCharSheetPromptWithClaude } from '../utils/charSheetPrompt'
 import { useInfluencers, useBrandDeals } from '../store'
 import WardrobeDrawer from '../components/WardrobeDrawer'
+import { storeImageAsset } from '../utils/assetStore'
+import { buildPhotoStudioGenerationRequest } from '../utils/generationRequestBuilder'
+import { extractReferenceAttributes } from '../utils/referenceExtractor'
 import {
   LOCATIONS, TIMES, EXPRESSIONS, PROP_SUGGESTIONS,
   getPoses, buildPhotoStudioPrompt, randomParams, getOutfitPresets,
@@ -379,7 +382,17 @@ function loadSettings(id) {
   try { return JSON.parse(localStorage.getItem(`ps_settings_${id || 'default'}`) || '{}') } catch { return {} }
 }
 
-const PS_DEFAULTS = { location: 'coffee-shop', timeOfDay: 'afternoon', pose: 'front', outfitPreset: 'current', stance: 'standing', aspectRatio: '9:16', resolution: '4k', outputCount: 1, expression: 'natural', gaze: 'at-camera', propText: '', wardrobeText: '', hairstyleText: '' }
+const PS_DEFAULTS = { location: 'coffee-shop', timeOfDay: 'afternoon', pose: 'front', outfitPreset: 'current', stance: 'standing', aspectRatio: '9:16', resolution: '4k', outputCount: 1, expression: 'natural', gaze: 'at-camera', propText: '', wardrobeText: '', hairstyleText: '', referenceSelection: { location: false, timeOfDay: false, pose: false, expression: false, outfit: false, hairstyle: false, cameraFraming: false, lightingStyle: false } }
+const REFERENCE_CONTROL_LABELS = [
+  ['location', 'Location'],
+  ['timeOfDay', 'Time of day'],
+  ['pose', 'Pose'],
+  ['expression', 'Expression'],
+  ['outfit', 'Outfit'],
+  ['hairstyle', 'Hairstyle'],
+  ['cameraFraming', 'Camera/framing'],
+  ['lightingStyle', 'Lighting/style'],
+]
 
 export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsStartFrame, onGeneratedPhoto, restoreKey = 0 }) {
   const [, setInfluencers] = useInfluencers()
@@ -399,6 +412,12 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
   const [propText,     setPropText]     = useState(_s.propText      ?? PS_DEFAULTS.propText)
   const [wardrobeText,   setWardrobeText]   = useState(_s.wardrobeText   ?? PS_DEFAULTS.wardrobeText)
   const [hairstyleText,  setHairstyleText]  = useState(_s.hairstyleText  ?? PS_DEFAULTS.hairstyleText)
+  const [referenceImage, setReferenceImage] = useState(() => {
+    try { return localStorage.getItem(`ps_reference_image_${influencer?.id}`) || null } catch { return null }
+  })
+  const [referenceAttrs, setReferenceAttrs] = useState(null)
+  const [referenceStatus, setReferenceStatus] = useState(null)
+  const [referenceSelection, setReferenceSelection] = useState(_s.referenceSelection ?? PS_DEFAULTS.referenceSelection)
   const [generating,    setGenerating]   = useState(false)
   const [lockedCount,   setLockedCount]  = useState(1)
   const [smoothPct,     setSmoothPct]    = useState(0)
@@ -415,6 +434,7 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
   const rafRef              = useRef(null)
   const elapsedRef          = useRef(null)
   const fileInputRef        = useRef(null)
+  const referenceFileRef    = useRef(null)
   const generatingForIdRef  = useRef(null)
   const currentInfluencerIdRef = useRef(influencer?.id)
   const settingsRef         = useRef({})
@@ -459,7 +479,7 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
   }
 
   // Keep settingsRef current so the switch useEffect can save before restoring
-  settingsRef.current = { location, timeOfDay, pose, vibe, outfitPreset, stance, aspectRatio, resolution, outputCount, expression, gaze, propText, wardrobeText, hairstyleText }
+  settingsRef.current = { location, timeOfDay, pose, vibe, outfitPreset, stance, aspectRatio, resolution, outputCount, expression, gaze, propText, wardrobeText, hairstyleText, referenceSelection }
 
   // Persist settings per-influencer (only when settings change, NOT when influencer switches)
   useEffect(() => {
@@ -467,7 +487,40 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
     try {
       localStorage.setItem(`ps_settings_${influencer.id}`, JSON.stringify(settingsRef.current))
     } catch {}
-  }, [location, timeOfDay, pose, vibe, outfitPreset, stance, aspectRatio, resolution, outputCount, expression, gaze, propText, wardrobeText, hairstyleText]) // eslint-disable-line
+  }, [location, timeOfDay, pose, vibe, outfitPreset, stance, aspectRatio, resolution, outputCount, expression, gaze, propText, wardrobeText, hairstyleText, referenceSelection]) // eslint-disable-line
+
+  useEffect(() => {
+    try {
+      if (!influencer?.id) return
+      referenceImage
+        ? localStorage.setItem(`ps_reference_image_${influencer.id}`, referenceImage)
+        : localStorage.removeItem(`ps_reference_image_${influencer.id}`)
+    } catch {}
+  }, [referenceImage, influencer?.id])
+
+  useEffect(() => {
+    let cancelled = false
+    async function run() {
+      setReferenceAttrs(null)
+      setReferenceStatus(null)
+      if (!referenceImage) return
+      try {
+        setReferenceStatus('analyzing')
+        await storeImageAsset(referenceImage, 'reference')
+        const claudeKey = localStorage.getItem('claude_api_key')
+        const attrs = await extractReferenceAttributes(referenceImage, Object.keys(referenceSelection).filter(k => referenceSelection[k]), claudeKey)
+        if (!cancelled) {
+          setReferenceAttrs(attrs)
+          setReferenceStatus(attrs?.cached ? 'cached' : (claudeKey ? 'done' : 'ready'))
+        }
+      } catch (e) {
+        console.warn('[Photo Studio] reference extraction failed:', e.message)
+        if (!cancelled) setReferenceStatus('error')
+      }
+    }
+    run()
+    return () => { cancelled = true }
+  }, [referenceImage]) // eslint-disable-line
 
   useEffect(() => {
     try {
@@ -525,6 +578,10 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
     setPropText(s.propText       ?? PS_DEFAULTS.propText)
     setWardrobeText(s.wardrobeText    ?? PS_DEFAULTS.wardrobeText)
     setHairstyleText(s.hairstyleText ?? PS_DEFAULTS.hairstyleText)
+    setReferenceSelection(s.referenceSelection ?? PS_DEFAULTS.referenceSelection)
+    try { setReferenceImage(id ? (localStorage.getItem(`ps_reference_image_${id}`) || null) : null) } catch { setReferenceImage(null) }
+    setReferenceAttrs(null)
+    setReferenceStatus(null)
     setCurrentImgs([])
     setError(null)
     setWardrobeOpen(false)
@@ -584,6 +641,7 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
       if (s.outfitPreset) setOutfitPreset(s.outfitPreset)
       if (s.wardrobeText !== undefined) setWardrobeText(s.wardrobeText)
       if (s.hairstyleText !== undefined) setHairstyleText(s.hairstyleText)
+      if (s.referenceSelection !== undefined) setReferenceSelection(s.referenceSelection)
       if (s.propText !== undefined)     setPropText(s.propText)
       if (s.aspectRatio)  setAspectRatio(s.aspectRatio)
       if (s.resolution)   setResolution(s.resolution)
@@ -616,7 +674,7 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
 
   function addToHistory(url, batchId) {
     const item = { histId: `${Date.now()}-${Math.random().toString(36).slice(2,7)}`, url, batchId, influencerId: influencer?.id, influencerName: influencer?.name, location, timeOfDay, pose, vibe, aspectRatio, createdAt: Date.now(),
-      settings: { location, timeOfDay, pose, stance, expression, gaze, outfitPreset, wardrobeText, hairstyleText, propText, aspectRatio, resolution, outputCount }
+      settings: { location, timeOfDay, pose, stance, expression, gaze, outfitPreset, wardrobeText, hairstyleText, propText, aspectRatio, resolution, outputCount, referenceSelection }
     }
     onGeneratedPhoto?.(item)
     setHistory(prev => {
@@ -706,6 +764,7 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
           outfitImage = selectedWardrobe.image
         }
       }
+      if (referenceImage && referenceSelection.outfit) outfitImage = null
 
       const faceRef      = overrideRef || influencer?.mainImage || null
       const closeUp1     = influencer?.closeUpImage1 || null
@@ -715,23 +774,57 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
       const wardrobeTag  = outfitImage ? `@image${++tagIdx}` : null
       const closeUp1Tag  = closeUp1   ? `@image${++tagIdx}` : null
       const closeUp2Tag  = closeUp2   ? `@image${++tagIdx}` : null
+      const referenceImageTag = referenceImage ? `@image${++tagIdx}` : null
       const allPropImages = propSlots.filter(s => s?.image).map(s => ({ img: s.image, mode: s.mode || 'holding' }))
       const propTags = allPropImages.map(() => `@image${++tagIdx}`)
       const propRefs = allPropImages.map(({ mode }, i) => ({ tag: propTags[i], mode }))
 
-      const promptArgs = { influencer, location, timeOfDay, pose, vibe, wardrobeText, hairstyleText, outfitPreset: resolvedPreset, stance, aspectRatio, expression, gaze, propText, propRefs, faceTag, wardrobeTag, closeUp1Tag, closeUp2Tag }
+      let activeReferenceAttrs = referenceAttrs
+      if (referenceImage && !activeReferenceAttrs) {
+        try {
+          setReferenceStatus('analyzing')
+          const claudeKey = localStorage.getItem('claude_api_key')
+          activeReferenceAttrs = await extractReferenceAttributes(referenceImage, Object.keys(referenceSelection).filter(k => referenceSelection[k]), claudeKey)
+          setReferenceAttrs(activeReferenceAttrs)
+          setReferenceStatus(activeReferenceAttrs?.cached ? 'cached' : (claudeKey ? 'done' : 'ready'))
+        } catch (e) {
+          console.warn('[Photo Studio] reference extraction failed:', e.message)
+          setReferenceStatus('error')
+        }
+      }
+
+      const safeReferenceAttrs = referenceImage
+        ? (activeReferenceAttrs || { negativeIdentityInstructions: ['Do not copy the person in the reference image', 'Use only the AI character identity from the character reference'] })
+        : null
+      const promptArgs = { influencer, location, timeOfDay, pose, vibe, wardrobeText, hairstyleText, outfitPreset: resolvedPreset, stance, aspectRatio, expression, gaze, propText, propRefs, faceTag, wardrobeTag, closeUp1Tag, closeUp2Tag, referenceImageTag, referenceAttributes: safeReferenceAttrs, referenceAttributeSelection: referenceSelection }
       const prompt = Array.from({ length: outputCount }, (_, i) => buildPhotoStudioPrompt({ ...promptArgs, variationIdx: i }))
+      const generationRequest = await buildPhotoStudioGenerationRequest({
+        prompt,
+        count: outputCount,
+        aspectRatio,
+        resolution,
+        referenceImage: faceRef,
+        outfitImage,
+        closeUpImage1: closeUp1,
+        closeUpImage2: closeUp2,
+        referenceStyleImage: referenceImage,
+        propImages: allPropImages.map(({ img }) => img),
+      })
 
       const batchId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
       let failureMessage = ''
       try {
         await generateNImages({
-          prompt, count: outputCount, aspectRatio, resolution,
-          referenceImage: faceRef,
-          outfitImage,
-          closeUpImage1: closeUp1,
-          closeUpImage2: closeUp2,
-          propImages: allPropImages.map(({ img }) => img),
+          prompt: generationRequest.prompt,
+          count: generationRequest.count,
+          aspectRatio: generationRequest.aspectRatio,
+          resolution: generationRequest.resolution,
+          referenceImage: generationRequest.referenceImage,
+          outfitImage: generationRequest.outfitImage,
+          closeUpImage1: generationRequest.closeUpImage1,
+          closeUpImage2: generationRequest.closeUpImage2,
+          referenceStyleImage: generationRequest.referenceStyleImage,
+          propImages: generationRequest.propImages,
           onProgress: pct => setSmoothPct(prev => Math.max(prev, pct)),
           onResult: url => {
             anySuccess = true
@@ -857,6 +950,21 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
     fontSize: 10, fontWeight: 700, color: 'var(--text-secondary)',
     textTransform: 'uppercase', letterSpacing: '0.6px', marginBottom: 7, display: 'block',
   }
+  const isRefInherited = key => !!referenceImage && !!referenceSelection[key]
+  const inheritedBox = (label, key, detail = 'Following the uploaded reference image for this attribute.') => (
+    <div style={{ padding: '10px 12px', borderRadius: 10, border: '1.5px solid rgba(139,92,246,0.28)', background: 'rgba(139,92,246,0.07)', display: 'flex', alignItems: 'center', gap: 10 }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 12, fontWeight: 800, color: '#8B5CF6', marginBottom: 2 }}>{label} inherited from reference</div>
+        <div style={{ fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.4 }}>{detail}</div>
+      </div>
+      <button
+        onClick={() => setReferenceSelection(prev => ({ ...prev, [key]: false }))}
+        style={{ padding: '6px 9px', borderRadius: 7, border: '1px solid rgba(139,92,246,0.3)', background: 'var(--bg)', color: '#8B5CF6', fontSize: 11, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit', flexShrink: 0 }}
+      >
+        Edit
+      </button>
+    </div>
+  )
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -987,52 +1095,157 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
         </div>
       )}
 
-      {/* ── Step 1: Location ── */}
+      {/* ── Step 1: Reference image attributes ── */}
       <PSec>
-        <PSHeader n={1} title="Location" />
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
-          {LOCATIONS.map(l => (
-            <button key={l.id} onClick={() => { setLocation(l.id); setRightMode('location') }} style={chipStyle(location === l.id)}>
-              {l.icon} {l.label}
-            </button>
-          ))}
-        </div>
+        <PSHeader n={1} title="Reference image" sub="scene/style extraction" />
         <input
-          type="text"
-          placeholder="Or type any location… Eiffel Tower, Tokyo alley, ski resort"
-          value={LOCATIONS.some(l => l.id === location) ? '' : (location || '')}
-          onChange={e => setLocation(e.target.value || null)}
-          style={{
-            width: '100%', boxSizing: 'border-box',
-            padding: '9px 12px', borderRadius: 10, fontSize: 12,
-            border: `1.5px solid ${!LOCATIONS.some(l => l.id === location) && location ? '#8B5CF6' : 'var(--border)'}`,
-            background: 'var(--bg)', color: 'var(--text-primary)',
-            outline: 'none', fontFamily: 'inherit',
-            transition: 'border-color 0.15s',
+          ref={referenceFileRef}
+          type="file"
+          accept="image/*"
+          style={{ display: 'none' }}
+          onChange={async e => {
+            const file = e.target.files?.[0]
+            if (!file || !file.type.startsWith('image/')) return
+            const dataUrl = await readImageFile(file)
+            setReferenceImage(dataUrl)
+            setReferenceAttrs(null)
+            e.target.value = ''
           }}
         />
-      </PSec>
 
-      {/* ── Step 2: Time of Day ── */}
-      <PSec>
-        <PSHeader n={2} title="Time of Day" />
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-          {TIMES.map(t => (
-            <button key={t.id} onClick={() => { setTimeOfDay(t.id); setRightMode('location') }} style={chipStyle(timeOfDay === t.id)}>
-              {t.label}
+        <div
+          onClick={() => referenceImage ? setExpandedImg(referenceImage) : referenceFileRef.current?.click()}
+          onDragOver={e => e.preventDefault()}
+          onDrop={async e => {
+            e.preventDefault()
+            const file = e.dataTransfer.files?.[0]
+            if (!file || !file.type.startsWith('image/')) return
+            const dataUrl = await readImageFile(file)
+            setReferenceImage(dataUrl)
+            setReferenceAttrs(null)
+          }}
+          style={{
+            border: '1.5px dashed var(--border)',
+            borderRadius: 10,
+            background: 'var(--bg)',
+            minHeight: 112,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            padding: 12,
+            cursor: 'pointer',
+            marginBottom: 12,
+          }}
+        >
+          {referenceImage ? (
+            <img src={referenceImage} alt="Reference" style={{ width: 72, height: 96, objectFit: 'cover', borderRadius: 8, flexShrink: 0 }} />
+          ) : (
+            <div style={{ width: 72, height: 96, borderRadius: 8, background: 'var(--bg-tertiary)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: 22, flexShrink: 0 }}>+</div>
+          )}
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', marginBottom: 4 }}>
+              {referenceImage ? 'Reference loaded' : 'Upload a photo to borrow scene details'}
+            </div>
+            <div style={{ fontSize: 11, lineHeight: 1.45, color: 'var(--text-tertiary)' }}>
+              Uses selected non-identity attributes only. The generated subject remains the AI character.
+            </div>
+            {referenceStatus && (
+              <div style={{ marginTop: 8, fontSize: 10, fontWeight: 700, color: referenceStatus === 'error' ? '#FF3B30' : referenceStatus === 'analyzing' ? '#8B5CF6' : '#34C759', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                {referenceStatus === 'analyzing' ? 'Analyzing' : referenceStatus === 'cached' ? 'Cached extraction' : referenceStatus === 'ready' ? 'Ready' : referenceStatus === 'done' ? 'Extracted' : 'Extraction unavailable'}
+              </div>
+            )}
+          </div>
+          {referenceImage && (
+            <button
+              onClick={e => {
+                e.stopPropagation()
+                setReferenceImage(null)
+                setReferenceAttrs(null)
+                setReferenceStatus(null)
+              }}
+              style={{ padding: '6px 9px', borderRadius: 7, border: '1px solid var(--border)', background: 'var(--bg-tertiary)', color: 'var(--text-secondary)', fontSize: 11, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}
+            >
+              Remove
             </button>
-          ))}
+          )}
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
+          {REFERENCE_CONTROL_LABELS.map(([key, label]) => {
+            const active = !!referenceSelection[key]
+            return (
+              <button
+                key={key}
+                onClick={() => setReferenceSelection(prev => ({ ...prev, [key]: !prev[key] }))}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  padding: '8px 10px', borderRadius: 8,
+                  border: `1.5px solid ${active ? 'rgba(139,92,246,0.45)' : 'var(--border)'}`,
+                  background: active ? 'rgba(139,92,246,0.08)' : 'var(--bg)',
+                  color: active ? '#8B5CF6' : 'var(--text-secondary)',
+                  cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, fontWeight: 700,
+                }}
+              >
+                <span style={{ width: 13, height: 13, borderRadius: 4, border: `1.5px solid ${active ? '#8B5CF6' : 'var(--border)'}`, background: active ? '#8B5CF6' : 'transparent', flexShrink: 0 }} />
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</span>
+              </button>
+            )
+          })}
         </div>
       </PSec>
 
-      {/* ── Step 3: Pose ── */}
+      {/* ── Step 2: Location ── */}
+      <PSec>
+        <PSHeader n={2} title="Location" />
+        {isRefInherited('location') ? inheritedBox('Location', 'location') : (
+          <>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+              {LOCATIONS.map(l => (
+                <button key={l.id} onClick={() => { setLocation(l.id); setRightMode('location') }} style={chipStyle(location === l.id)}>
+                  {l.icon} {l.label}
+                </button>
+              ))}
+            </div>
+            <input
+              type="text"
+              placeholder="Or type any location… Eiffel Tower, Tokyo alley, ski resort"
+              value={LOCATIONS.some(l => l.id === location) ? '' : (location || '')}
+              onChange={e => setLocation(e.target.value || null)}
+              style={{
+                width: '100%', boxSizing: 'border-box',
+                padding: '9px 12px', borderRadius: 10, fontSize: 12,
+                border: `1.5px solid ${!LOCATIONS.some(l => l.id === location) && location ? '#8B5CF6' : 'var(--border)'}`,
+                background: 'var(--bg)', color: 'var(--text-primary)',
+                outline: 'none', fontFamily: 'inherit',
+                transition: 'border-color 0.15s',
+              }}
+            />
+          </>
+        )}
+      </PSec>
+
+      {/* ── Step 3: Time of Day ── */}
+      <PSec>
+        <PSHeader n={3} title="Time of Day" />
+        {isRefInherited('timeOfDay') ? inheritedBox('Time of day', 'timeOfDay') : (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {TIMES.map(t => (
+              <button key={t.id} onClick={() => { setTimeOfDay(t.id); setRightMode('location') }} style={chipStyle(timeOfDay === t.id)}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </PSec>
+
+      {/* ── Step 4: Pose ── */}
       <PSec>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <div style={{ width: 22, height: 22, borderRadius: '50%', flexShrink: 0, background: 'linear-gradient(135deg,#EC4899,#8B5CF6)', color: '#fff', fontSize: 11, fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>3</div>
+            <div style={{ width: 22, height: 22, borderRadius: '50%', flexShrink: 0, background: 'linear-gradient(135deg,#EC4899,#8B5CF6)', color: '#fff', fontSize: 11, fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>4</div>
             <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)' }}>Pose</div>
           </div>
-          {!hasStancePreviews && (
+          {!isRefInherited('pose') && !hasStancePreviews && (
             <button
               onClick={async () => {
                 if (poseGenerating || !influencer) return
@@ -1065,44 +1278,48 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
             </button>
           )}
         </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
-          {currentPoses.filter(p => !(stance === 'sitting' && (p.id === 'walking' || p.id === 'facing-away'))).map(p => (
-            <button key={p.id} onClick={() => { setPose(p.id); setRightMode('pose') }} style={chipStyle(pose === p.id)}>
-              {p.label}
-            </button>
-          ))}
-        </div>
-        <input
-          type="text"
-          placeholder="Or describe any pose… arms crossed looking out a window, spinning around"
-          value={currentPoses.some(p => p.id === pose) ? '' : (pose || '')}
-          onChange={e => setPose(e.target.value || 'front')}
-          style={{
-            width: '100%', boxSizing: 'border-box',
-            padding: '9px 12px', borderRadius: 10, fontSize: 12, marginBottom: 12,
-            border: `1.5px solid ${!currentPoses.some(p => p.id === pose) && pose && pose !== 'front' ? '#8B5CF6' : 'var(--border)'}`,
-            background: 'var(--bg)', color: 'var(--text-primary)',
-            outline: 'none', fontFamily: 'inherit',
-            transition: 'border-color 0.15s',
-          }}
-        />
-        <div style={{ display: 'flex', borderRadius: 8, overflow: 'hidden', border: '1px solid var(--border)', width: 'fit-content' }}>
-          {['standing', 'sitting'].map(s => (
-            <button key={s} onClick={() => setStance(s)} style={{
-              padding: '5px 16px', fontSize: 12, fontWeight: 600, fontFamily: 'inherit',
-              background: stance === s ? '#8B5CF6' : 'var(--bg)',
-              color: stance === s ? '#fff' : 'var(--text-secondary)',
-              border: 'none', cursor: 'pointer', transition: 'all 0.12s',
-              textTransform: 'capitalize',
-            }}>{s}</button>
-          ))}
-        </div>
+        {isRefInherited('pose') ? inheritedBox('Pose', 'pose') : (
+          <>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+              {currentPoses.filter(p => !(stance === 'sitting' && (p.id === 'walking' || p.id === 'facing-away'))).map(p => (
+                <button key={p.id} onClick={() => { setPose(p.id); setRightMode('pose') }} style={chipStyle(pose === p.id)}>
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            <input
+              type="text"
+              placeholder="Or describe any pose… arms crossed looking out a window, spinning around"
+              value={currentPoses.some(p => p.id === pose) ? '' : (pose || '')}
+              onChange={e => setPose(e.target.value || 'front')}
+              style={{
+                width: '100%', boxSizing: 'border-box',
+                padding: '9px 12px', borderRadius: 10, fontSize: 12, marginBottom: 12,
+                border: `1.5px solid ${!currentPoses.some(p => p.id === pose) && pose && pose !== 'front' ? '#8B5CF6' : 'var(--border)'}`,
+                background: 'var(--bg)', color: 'var(--text-primary)',
+                outline: 'none', fontFamily: 'inherit',
+                transition: 'border-color 0.15s',
+              }}
+            />
+            <div style={{ display: 'flex', borderRadius: 8, overflow: 'hidden', border: '1px solid var(--border)', width: 'fit-content' }}>
+              {['standing', 'sitting'].map(s => (
+                <button key={s} onClick={() => setStance(s)} style={{
+                  padding: '5px 16px', fontSize: 12, fontWeight: 600, fontFamily: 'inherit',
+                  background: stance === s ? '#8B5CF6' : 'var(--bg)',
+                  color: stance === s ? '#fff' : 'var(--text-secondary)',
+                  border: 'none', cursor: 'pointer', transition: 'all 0.12s',
+                  textTransform: 'capitalize',
+                }}>{s}</button>
+              ))}
+            </div>
+          </>
+        )}
       </PSec>
 
-      {/* ── Step 4: Expression ── */}
+      {/* ── Step 5: Expression ── */}
       <PSec>
-        <PSHeader n={4} title="Expression" />
-        {pose === 'facing-away' ? (
+        <PSHeader n={5} title="Expression" />
+        {isRefInherited('expression') ? inheritedBox('Expression', 'expression') : pose === 'facing-away' ? (
           <div style={{ fontSize: 12, color: 'var(--text-tertiary)', padding: '10px 12px', background: 'var(--bg-tertiary)', borderRadius: 10, lineHeight: 1.5 }}>
             Not applicable — face is not visible when posing away from the camera.
           </div>
@@ -1145,121 +1362,127 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
 
       {/* ── Step 6: Outfit ── */}
       <PSec>
-        <PSHeader n={5} title="Outfit" />
+        <PSHeader n={6} title="Outfit" />
 
-        {/* 6A — Wardrobe reference images */}
-        <div style={{ marginBottom: 16 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
-            <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.6px' }}>Wardrobe</div>
-            <button
-              onClick={() => setWardrobeOpen(true)}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 4,
-                padding: '2px 8px', borderRadius: 980, fontSize: 10, fontWeight: 600,
-                border: '1px solid rgba(139,92,246,0.35)', background: 'rgba(139,92,246,0.08)',
-                color: '#8B5CF6', cursor: 'pointer', fontFamily: 'inherit',
-              }}
-            >
-              <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-              Add
-            </button>
-          </div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-            <OutfitCard
-              image={influencer?.characterSheetImage || null}
-              label="Current"
-              active={outfitPreset === 'current' && !wardrobeText}
-              onClick={() => { setOutfitPreset('current'); setWardrobeText('') }}
-            />
-            {wardrobeSlots.filter(s => s.image).map(s => {
-              const active = outfitPreset === s.id && !wardrobeText
-              return (
-                <OutfitCard
-                  key={s.id}
-                  image={s.image}
-                  label={s.name}
-                  active={active}
-                  onClick={() => { setOutfitPreset(active ? 'current' : s.id); setWardrobeText('') }}
-                />
-              )
-            })}
-          </div>
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '4px 0 16px' }}>
-          <div style={{ flex: 1, height: 1, background: 'var(--border-subtle)' }} />
-          <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.8px' }}>or</span>
-          <div style={{ flex: 1, height: 1, background: 'var(--border-subtle)' }} />
-        </div>
-
-        {/* 6B — Style presets (gender-aware) */}
-        <div style={{ marginBottom: 16 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.6px', marginBottom: 10 }}>Preset Style</div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-            {getOutfitPresets(influencer?.gender).map(({ id, label }) => {
-              const active = outfitPreset === id && !wardrobeText
-              return (
-                <button key={id} onClick={() => { setOutfitPreset(active ? 'current' : id); setWardrobeText('') }} style={chipStyle(active)}>
-                  {label}
+        {isRefInherited('outfit') ? inheritedBox('Outfit', 'outfit') : (
+          <>
+            {/* 6A — Wardrobe reference images */}
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.6px' }}>Wardrobe</div>
+                <button
+                  onClick={() => setWardrobeOpen(true)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 4,
+                    padding: '2px 8px', borderRadius: 980, fontSize: 10, fontWeight: 600,
+                    border: '1px solid rgba(139,92,246,0.35)', background: 'rgba(139,92,246,0.08)',
+                    color: '#8B5CF6', cursor: 'pointer', fontFamily: 'inherit',
+                  }}
+                >
+                  <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                  Add
                 </button>
-              )
-            })}
-          </div>
-        </div>
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                <OutfitCard
+                  image={influencer?.characterSheetImage || null}
+                  label="Current"
+                  active={outfitPreset === 'current' && !wardrobeText}
+                  onClick={() => { setOutfitPreset('current'); setWardrobeText('') }}
+                />
+                {wardrobeSlots.filter(s => s.image).map(s => {
+                  const active = outfitPreset === s.id && !wardrobeText
+                  return (
+                    <OutfitCard
+                      key={s.id}
+                      image={s.image}
+                      label={s.name}
+                      active={active}
+                      onClick={() => { setOutfitPreset(active ? 'current' : s.id); setWardrobeText('') }}
+                    />
+                  )
+                })}
+              </div>
+            </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '4px 0 16px' }}>
-          <div style={{ flex: 1, height: 1, background: 'var(--border-subtle)' }} />
-          <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.8px' }}>or</span>
-          <div style={{ flex: 1, height: 1, background: 'var(--border-subtle)' }} />
-        </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '4px 0 16px' }}>
+              <div style={{ flex: 1, height: 1, background: 'var(--border-subtle)' }} />
+              <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.8px' }}>or</span>
+              <div style={{ flex: 1, height: 1, background: 'var(--border-subtle)' }} />
+            </div>
 
-        {/* 6C — Custom text */}
-        <div style={{ marginBottom: 16 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.6px', marginBottom: 10 }}>Custom</div>
-          <textarea
-            value={wardrobeText}
-            onChange={e => { setWardrobeText(e.target.value); if (e.target.value) setOutfitPreset('current') }}
-            placeholder="Describe your outfit here…"
-            rows={2}
-            style={{
-              width: '100%', padding: '10px 12px', borderRadius: 9,
-              border: `1.5px solid ${wardrobeText ? '#8B5CF6' : 'var(--border)'}`,
-              background: 'var(--bg)', fontSize: 13, color: 'var(--text-primary)',
-              lineHeight: 1.5, resize: 'none', fontFamily: 'inherit',
-              boxSizing: 'border-box', outline: 'none', transition: 'border-color 0.15s',
-            }}
-          />
-        </div>
+            {/* 6B — Style presets (gender-aware) */}
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.6px', marginBottom: 10 }}>Preset Style</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {getOutfitPresets(influencer?.gender).map(({ id, label }) => {
+                  const active = outfitPreset === id && !wardrobeText
+                  return (
+                    <button key={id} onClick={() => { setOutfitPreset(active ? 'current' : id); setWardrobeText('') }} style={chipStyle(active)}>
+                      {label}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '4px 0 16px' }}>
+              <div style={{ flex: 1, height: 1, background: 'var(--border-subtle)' }} />
+              <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.8px' }}>or</span>
+              <div style={{ flex: 1, height: 1, background: 'var(--border-subtle)' }} />
+            </div>
+
+            {/* 6C — Custom text */}
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.6px', marginBottom: 10 }}>Custom</div>
+              <textarea
+                value={wardrobeText}
+                onChange={e => { setWardrobeText(e.target.value); if (e.target.value) setOutfitPreset('current') }}
+                placeholder="Describe your outfit here…"
+                rows={2}
+                style={{
+                  width: '100%', padding: '10px 12px', borderRadius: 9,
+                  border: `1.5px solid ${wardrobeText ? '#8B5CF6' : 'var(--border)'}`,
+                  background: 'var(--bg)', fontSize: 13, color: 'var(--text-primary)',
+                  lineHeight: 1.5, resize: 'none', fontFamily: 'inherit',
+                  boxSizing: 'border-box', outline: 'none', transition: 'border-color 0.15s',
+                }}
+              />
+            </div>
+          </>
+        )}
 
         {/* 6D — Hairstyle lock */}
         <div>
-          <button
-            onClick={() => {
-              const next = !hairstyleLocked
-              setHairstyleLocked(next)
-              if (!next) setHairstyleText('')
-            }}
-            style={{
-              display: 'flex', alignItems: 'center', gap: 8,
-              padding: '8px 12px', borderRadius: 9, width: '100%',
-              background: hairstyleLocked ? 'rgba(139,92,246,0.08)' : 'var(--bg-tertiary)',
-              border: `1.5px solid ${hairstyleLocked ? 'rgba(139,92,246,0.35)' : 'var(--border)'}`,
-              cursor: 'pointer', fontFamily: 'inherit', transition: 'all 0.15s',
-            }}
-          >
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={hairstyleLocked ? '#8B5CF6' : 'var(--text-tertiary)'} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-              {hairstyleLocked
-                ? <><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></>
-                : <><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></>
-              }
-            </svg>
-            <span style={{ fontSize: 12, fontWeight: 600, color: hairstyleLocked ? '#8B5CF6' : 'var(--text-tertiary)', flex: 1, textAlign: 'left' }}>
-              {hairstyleLocked ? 'Hairstyle locked' : 'Lock hairstyle'}
-            </span>
-            <span style={{ fontSize: 10, color: hairstyleLocked ? 'rgba(139,92,246,0.6)' : 'var(--text-tertiary)', fontStyle: 'italic' }}>
-              {hairstyleLocked ? 'overrides all refs' : 'optional'}
-            </span>
-          </button>
+          {isRefInherited('hairstyle') && !hairstyleLocked ? inheritedBox('Hairstyle', 'hairstyle') : (
+            <button
+              onClick={() => {
+                const next = !hairstyleLocked
+                setHairstyleLocked(next)
+                if (!next) setHairstyleText('')
+              }}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '8px 12px', borderRadius: 9, width: '100%',
+                background: hairstyleLocked ? 'rgba(139,92,246,0.08)' : 'var(--bg-tertiary)',
+                border: `1.5px solid ${hairstyleLocked ? 'rgba(139,92,246,0.35)' : 'var(--border)'}`,
+                cursor: 'pointer', fontFamily: 'inherit', transition: 'all 0.15s',
+              }}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={hairstyleLocked ? '#8B5CF6' : 'var(--text-tertiary)'} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                {hairstyleLocked
+                  ? <><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></>
+                  : <><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></>
+                }
+              </svg>
+              <span style={{ fontSize: 12, fontWeight: 600, color: hairstyleLocked ? '#8B5CF6' : 'var(--text-tertiary)', flex: 1, textAlign: 'left' }}>
+                {hairstyleLocked ? 'Hairstyle locked' : 'Lock hairstyle'}
+              </span>
+              <span style={{ fontSize: 10, color: hairstyleLocked ? 'rgba(139,92,246,0.6)' : 'var(--text-tertiary)', fontStyle: 'italic' }}>
+                {hairstyleLocked ? 'overrides all refs' : 'optional'}
+              </span>
+            </button>
+          )}
           {hairstyleLocked && (
             <input
               autoFocus
@@ -1279,10 +1502,10 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
         </div>
       </PSec>
 
-      {/* ── Step 6: Props ── */}
+      {/* ── Step 7: Props ── */}
       <PSec>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
-          <div style={{ width: 22, height: 22, borderRadius: '50%', flexShrink: 0, background: 'linear-gradient(135deg,#EC4899,#8B5CF6)', color: '#fff', fontSize: 11, fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>6</div>
+          <div style={{ width: 22, height: 22, borderRadius: '50%', flexShrink: 0, background: 'linear-gradient(135deg,#EC4899,#8B5CF6)', color: '#fff', fontSize: 11, fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>7</div>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
             <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)' }}>Props</div>
             <div style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-tertiary)', fontStyle: 'italic', letterSpacing: '0.1px' }}>(optional)</div>
@@ -1516,7 +1739,7 @@ export default function PhotoStudioPanel({ influencer, onGoToWardrobe, onUseAsSt
 
       {/* ── Step 8: Format ── */}
       <PSec>
-        <PSHeader n={7} title="Format" />
+        <PSHeader n={8} title="Format" />
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 14 }}>
           {[{id:'9:16',w:10,h:16},{id:'16:9',w:16,h:10}].map(a => (
             <button key={a.id} onClick={() => setAspectRatio(a.id)} style={{ ...chipStyle(aspectRatio === a.id), display: 'flex', alignItems: 'center', gap: 7 }}>
