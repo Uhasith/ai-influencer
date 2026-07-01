@@ -1,5 +1,17 @@
+import { removePersistedSettings, savePersistedSetting, savePersistedSettings } from './persistentSettings'
+
 const AUTH_PROXY = '/api/hf'           // fetch calls — goes through proxy, bypasses CORS
 const AUTH_DIRECT = 'https://mcp.higgsfield.ai' // browser redirect — must be real URL
+
+function getRedirectUri() {
+  return `${window.location.origin}/auth/callback`
+}
+
+function clearClientRegistration() {
+  localStorage.removeItem('hf_client_id')
+  localStorage.removeItem('hf_client_redirect_uri')
+  removePersistedSettings(['hf_client_id', 'hf_client_redirect_uri'])
+}
 
 // Higgsfield rate-limits its OAuth endpoints by IP. Because every user's traffic
 // egresses through our shared Vercel edge IPs, concurrent connects collectively trip
@@ -55,13 +67,17 @@ function randomString(n = 64) {
 
 async function ensureClientId() {
   const stored = localStorage.getItem('hf_client_id')
-  if (stored) return stored
+  const redirectUri = getRedirectUri()
+  const storedRedirectUri = localStorage.getItem('hf_client_redirect_uri')
+  if (stored && storedRedirectUri === redirectUri) return stored
+  if (stored) clearClientRegistration()
+
   const res = await fetchWithRetry(`${AUTH_PROXY}/oauth2/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     body: JSON.stringify({
       client_name: 'AI Influencer Studio',
-      redirect_uris: [`${window.location.origin}/auth/callback`],
+      redirect_uris: [redirectUri],
       grant_types: ['authorization_code'],
       response_types: ['code'],
       token_endpoint_auth_method: 'none',
@@ -77,6 +93,11 @@ async function ensureClientId() {
   const d = await res.json()
   if (!d.client_id) throw new Error('Registration returned no client_id')
   localStorage.setItem('hf_client_id', d.client_id)
+  localStorage.setItem('hf_client_redirect_uri', redirectUri)
+  savePersistedSettings({
+    hf_client_id: d.client_id,
+    hf_client_redirect_uri: redirectUri,
+  })
   return d.client_id
 }
 
@@ -90,7 +111,7 @@ async function buildAuthUrl() {
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: clientId,
-    redirect_uri: `${window.location.origin}/auth/callback`,
+    redirect_uri: getRedirectUri(),
     scope: 'openid email offline_access',
     state,
     code_challenge: challenge,
@@ -143,7 +164,7 @@ export async function startHiggsfieldOAuthPopup() {
       if (e.origin !== window.location.origin) return
       if (e.data?.type === 'hf_auth_success') {
         // Only mark referral as fired after OAuth actually succeeds
-        if (!referralDone) localStorage.setItem('hf_referral_fired', '1')
+        if (!referralDone) savePersistedSetting('hf_referral_fired', '1')
         cleanup(); resolve()
       }
       else if (e.data?.type === 'hf_auth_error') { cleanup(); reject(new Error(e.data.error)) }
@@ -155,11 +176,17 @@ export async function startHiggsfieldOAuthPopup() {
 }
 
 function saveTokens(tokens) {
+  const settings = { hf_access_token: tokens.access_token }
   localStorage.setItem('hf_access_token', tokens.access_token)
   if (tokens.expires_in) {
-    localStorage.setItem('hf_token_expires_at', String(Date.now() + tokens.expires_in * 1000))
+    settings.hf_token_expires_at = String(Date.now() + tokens.expires_in * 1000)
+    localStorage.setItem('hf_token_expires_at', settings.hf_token_expires_at)
   }
-  if (tokens.refresh_token) localStorage.setItem('hf_refresh_token', tokens.refresh_token)
+  if (tokens.refresh_token) {
+    settings.hf_refresh_token = tokens.refresh_token
+    localStorage.setItem('hf_refresh_token', tokens.refresh_token)
+  }
+  savePersistedSettings(settings)
 }
 
 function needsRefresh() {
@@ -182,7 +209,7 @@ export async function handleOAuthCallback(code, state) {
     body: new URLSearchParams({
       grant_type: 'authorization_code',
       code,
-      redirect_uri: `${window.location.origin}/auth/callback`,
+      redirect_uri: getRedirectUri(),
       client_id: clientId,
       code_verifier: verifier,
     }),
@@ -196,9 +223,7 @@ export async function handleOAuthCallback(code, state) {
     localStorage.removeItem('hf_verifier')
     localStorage.removeItem('hf_state')
     // A rejected client means our cached registration is no longer valid upstream — drop it so we re-register
-    if (e.error === 'invalid_client' || res.status === 401) {
-      localStorage.removeItem('hf_client_id')
-    }
+    if (e.error === 'invalid_client' || res.status === 401) clearClientRegistration()
     throw new Error(reason)
   }
   const tokens = await res.json()
@@ -213,6 +238,7 @@ export function isHFConnected() { return !!getHFToken() }
 export function disconnectHF() {
   ['hf_access_token', 'hf_refresh_token', 'hf_token_expires_at', 'hf_verifier', 'hf_state']
     .forEach(k => localStorage.removeItem(k))
+  removePersistedSettings(['hf_access_token', 'hf_refresh_token', 'hf_token_expires_at'])
 }
 
 export async function refreshHFToken() {
@@ -263,5 +289,5 @@ export async function silentRefreshHFToken() {
 export function fireReferralOnce() {
   if (localStorage.getItem('hf_referral_fired')) return
   window.open('https://higgsfield.ai/?fpr=dankieft&fp_sid=tool', '_blank', 'noopener,noreferrer')
-  localStorage.setItem('hf_referral_fired', '1')
+  savePersistedSetting('hf_referral_fired', '1')
 }

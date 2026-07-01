@@ -4,6 +4,7 @@ import { Analytics } from '@vercel/analytics/react'
 import { ThemeProvider, useTheme } from './context/theme'
 import { StoreProvider } from './store'
 import { silentRefreshHFToken } from './utils/higgsfieldAuth'
+import { loadPersistedSettings } from './utils/persistentSettings'
 import Nav from './components/Nav'
 import Landing from './pages/Landing'
 import Influencers from './pages/Influencers'
@@ -52,7 +53,7 @@ function FeedbackButton() {
 
 export default function App() {
   useEffect(() => {
-    silentRefreshHFToken()
+    loadPersistedSettings().finally(() => silentRefreshHFToken())
     function onVisible() {
       if (document.visibilityState === 'visible') silentRefreshHFToken()
     }

@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { useLocation } from 'react-router-dom'
 import { startHiggsfieldOAuthPopup, disconnectHF, isHFConnected } from '../utils/higgsfieldAuth'
 import { useTheme } from '../context/theme'
+import { loadPersistedSettings, removePersistedSettings, savePersistedSetting } from '../utils/persistentSettings'
 
 function Section({ title, children }) {
   return (
@@ -24,6 +25,17 @@ export default function Settings() {
   const [claudeKey, setClaudeKey] = useState(() => localStorage.getItem(CLAUDE_KEY) || '')
   const [claudeInput, setClaudeInput] = useState('')
   const [showClaudeInput, setShowClaudeInput] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    loadPersistedSettings().then(settings => {
+      if (cancelled) return
+      setClaudeKey(settings[CLAUDE_KEY] || localStorage.getItem(CLAUDE_KEY) || '')
+      setHfConnected(isHFConnected())
+    })
+    return () => { cancelled = true }
+  }, [])
+
   useEffect(() => {
     const params = new URLSearchParams(location.search)
     if (params.get('connected') === '1') {
@@ -135,7 +147,7 @@ export default function Settings() {
                   <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>···{claudeKey.slice(-4)}</span>
                 </div>
                 <button
-                  onClick={() => { localStorage.removeItem(CLAUDE_KEY); setClaudeKey(''); setClaudeInput(''); setShowClaudeInput(false) }}
+                  onClick={() => { removePersistedSettings([CLAUDE_KEY]); setClaudeKey(''); setClaudeInput(''); setShowClaudeInput(false) }}
                   style={{ padding: '7px 14px', borderRadius: 8, fontSize: 13, color: '#FF3B30', background: 'rgba(255,59,48,0.08)', border: '1px solid rgba(255,59,48,0.18)', fontWeight: 500 }}
                 >
                   Remove
@@ -153,7 +165,7 @@ export default function Settings() {
                 onKeyDown={e => {
                   if (e.key === 'Enter' && claudeInput.trim()) {
                     const k = claudeInput.trim()
-                    localStorage.setItem(CLAUDE_KEY, k)
+                    savePersistedSetting(CLAUDE_KEY, k)
                     setClaudeKey(k)
                     setClaudeInput('')
                     setShowClaudeInput(false)
@@ -165,7 +177,7 @@ export default function Settings() {
                 onClick={() => {
                   const k = claudeInput.trim()
                   if (!k) return
-                  localStorage.setItem(CLAUDE_KEY, k)
+                  savePersistedSetting(CLAUDE_KEY, k)
                   setClaudeKey(k)
                   setClaudeInput('')
                   setShowClaudeInput(false)

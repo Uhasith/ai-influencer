@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import { getInfluencers, mergeInfluencers, saveInfluencers } from './lib/localSqlite.js'
+import { getAppSettings, getInfluencers, mergeInfluencers, removeAppSettings, saveAppSettings, saveInfluencers } from './lib/localSqlite.js'
 
 async function readJsonBody(req) {
   const chunks = []
@@ -19,6 +19,35 @@ function sendJson(res, status, data) {
 const localSqlitePlugin = {
   name: 'local-sqlite-store',
   configureServer(server) {
+    server.middlewares.use('/api/local/settings', async (req, res) => {
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, DELETE, OPTIONS')
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+      if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return }
+
+      try {
+        if (req.method === 'GET') {
+          sendJson(res, 200, { settings: await getAppSettings() })
+          return
+        }
+        if (req.method === 'PUT') {
+          const body = await readJsonBody(req)
+          await saveAppSettings(body?.settings || {})
+          sendJson(res, 200, { ok: true })
+          return
+        }
+        if (req.method === 'DELETE') {
+          const body = await readJsonBody(req)
+          await removeAppSettings(body?.keys || [])
+          sendJson(res, 200, { ok: true })
+          return
+        }
+        sendJson(res, 405, { error: 'Method not allowed' })
+      } catch (e) {
+        sendJson(res, 500, { error: e.message })
+      }
+    })
+
     server.middlewares.use('/api/local/influencers', async (req, res) => {
       res.setHeader('Access-Control-Allow-Origin', '*')
       res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, POST, OPTIONS')
